@@ -1,34 +1,242 @@
 ---
 title: "EV Power - Lab 4 Project Report"
 format: typst
+author: "Fengyi Huang"
+execute:
+  echo: false      # hides code
+  warning: false   # hides warnings
+  message: false   # hides package messages
 ---
 
-# Example Solution 1
-
-## **Part 0: libraries**
-
 ```{r}
-
+library(tidyverse)
+library(janitor)
+library(readr)
+library(stringr)
+library(dplyr)
+library(sf)
+library(tigris)
+library(ggplot2)
+library(viridis)
+library(scales)
+library(leaflet)
 ```
 
-## **Part 1:** **Defining Research Question**
 
-Chosen Question:
+Research Question: Does EV adoption align with cleaner electricity supply across states, and how has that alignment changed from 2021–2023?
 
-## **Part 2: Data Preparation and Cleaning**
-
-```{r}
-
-```
-
-## **Part 3: Joining / Pivoting Datasets for Analysis**
+In this report, what we are hoping to see is whether the adoption of EV cars would align with cleaner electricity supplies across the states, but not only that, to see whether this has changed across the years or not. 
 
 ```{r}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+options(readr.show_progress = FALSE, tigris_use_cache = TRUE)
 
+data_dir <- "data"
+years    <- 2021:2023
+
+price_file <- file.path(data_dir, "av-energy-price-2021-2023.csv")
+ev_file    <- file.path(data_dir, "ev-registrations-by-state-2023.csv")
+
+renew_files <- file.path(data_dir, sprintf("renew-use-%d.csv", years))
+total_files <- file.path(data_dir, sprintf("total-use-%d.csv", years))
+names(renew_files) <- years
+names(total_files) <- years
+
+yr_from_name <- function(path) {
+  basename(path) |>
+    stringr::str_extract("\\d{4}") |>
+    as.integer()
+}
+
+state_map <- tibble(
+  state = c(state.name, "District of Columbia"),
+  abbr  = c(state.abb,  "DC")
+)
+
+to_full_state <- function(x) {
+  dplyr::case_when(
+    x %in% state_map$abbr  ~ state_map$state[match(x, state_map$abbr)],
+    x %in% state_map$state ~ x,
+    TRUE ~ x
+  )
+}
+
+ev_2023 <- read_csv(ev_file, show_col_types = FALSE, progress = FALSE) |>
+  rename(state = 1, ev_count = 2) |>
+  mutate(state = state |> str_trim()) |>
+  filter(state %in% state_map$state | state %in% state_map$abbr) |>
+  mutate(
+    state    = to_full_state(state),
+    ev_count = readr::parse_number(as.character(ev_count)),
+    year     = 2023L
+  ) |>
+  select(state, year, ev_count)
 ```
 
-## **Part 4: Mapping Visualization**
+In this section, we have assembled a state and year dataset that includes each state’s total energy use, renewable energy use, and the resulting renewable share (renewable use divided by their total use). We've also created a 2023 table that joins this information to each state’s EV registrations, and a summary table showing the change in renewable share from 2021 to 2023 to highlight where grids are getting cleaner or whether they are going down.
 
 ```{r}
+read_total_year <- function(path, yr) {
+  read_csv(path, show_col_types = FALSE, progress = FALSE) |>
+    pivot_longer(-Energy_Source, names_to = "abbr", values_to = "value") |>
+    mutate(
+      abbr  = stringr::str_to_upper(abbr),
+      value = readr::parse_number(as.character(value))  # <-- key change
+    ) |>
+    filter(abbr %in% state_map$abbr) |>
+    group_by(abbr) |>
+    summarise(total_use = sum(value, na.rm = TRUE), .groups = "drop") |>
+    left_join(state_map, by = "abbr") |>
+    transmute(state, year = yr, total_use)
+}
 
+total_2021 <- read_total_year(total_files["2021"], 2021)
+total_2022 <- read_total_year(total_files["2022"], 2022)
+total_2023 <- read_total_year(total_files["2023"], 2023)
+
+total_all <- bind_rows(total_2021, total_2022, total_2023)
+
+to_full_state <- function(x) {
+  dplyr::case_when(
+    x %in% state_map$abbr  ~ state_map$state[match(x, state_map$abbr)],
+    x %in% state_map$state ~ x,
+    TRUE ~ x
+  )
+}
+
+renew_2021 <- read_csv(renew_files["2021"], show_col_types = FALSE, progress = FALSE) |>
+  group_by(State = to_full_state(State)) |>
+  summarise(
+    renew_use = sum(readr::parse_number(Renewable_Use_2021), na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(year = 2021L) |>
+  rename(state = State)
+
+renew_2022 <- read_csv(renew_files["2022"], show_col_types = FALSE, progress = FALSE) |>
+  group_by(State = to_full_state(State)) |>
+  summarise(
+    renew_use = sum(readr::parse_number(Renewable_Use_2022), na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(year = 2022L) |>
+  rename(state = State)
+
+renew_2023 <- read_csv(renew_files["2023"], show_col_types = FALSE, progress = FALSE) |>
+  group_by(State = to_full_state(State)) |>
+  summarise(
+    renew_use = sum(readr::parse_number(Renewable_Use_2023), na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(year = 2023L) |>
+  rename(state = State)
+
+renew_all <- bind_rows(renew_2021, renew_2022, renew_2023)
+
+price_raw <- read_csv(price_file, show_col_types = FALSE, progress = FALSE)
+
+if (ncol(price_raw) == 1) {
+  price_raw <- price_raw |>
+    tidyr::separate_wider_delim(
+      cols = 1, delim = ",",
+      names = c("state", "x2021", "x2022", "x2023"),
+      too_few = "align_start", cols_remove = FALSE
+    )
+}
+
+price_long <- price_raw |>
+  select(state = 1, `2021` = 2, `2022` = 3, `2023` = 4) |>
+  mutate(
+    state = state |> str_trim(),
+    `2021` = readr::parse_number(`2021`),
+    `2022` = readr::parse_number(`2022`),
+    `2023` = readr::parse_number(`2023`)
+  ) |>
+  pivot_longer(c(`2021`,`2022`,`2023`), names_to = "year", values_to = "price") |>
+  mutate(year = as.integer(year)) |>
+  semi_join(state_map, by = "state")
+
+energy_all <- renew_all |>
+  inner_join(total_all, by = c("state","year")) |>
+  left_join(price_long, by = c("state","year")) |>
+  mutate(renewable_share = if_else(total_use > 0, renew_use / total_use, NA_real_))
+
+energy_2023 <- energy_all |>
+  filter(year == 2023L) |>
+  left_join(ev_2023 |> select(state, ev_count), by = "state")
+
+
+energy_all |>
+  dplyr::select(state, year, renew_use, total_use, price, renewable_share) |>
+  head(8) |>
+  knitr::kable()
+
+energy_2023 |>
+  dplyr::select(state, renew_use, total_use, renewable_share, price, ev_count) |>
+  head(8) |>
+  knitr::kable()
+
+
+share_change <- energy_all |>
+  dplyr::select(state, year, renewable_share) |>
+  tidyr::pivot_wider(names_from = year, values_from = renewable_share) |>
+  dplyr::mutate(delta_21_23 = `2023` - `2021`) |>
+  dplyr::arrange(dplyr::desc(delta_21_23))
+
+share_change |>
+  dplyr::select(state, `2021`, `2023`, delta_21_23) |>
+  head(8) |>
+  knitr::kable()
 ```
+
+In the following maps, we can see two main maps. The first of which is renewable share of energy by state in 2023, the most recent data, and see which states are focusing more on renewable energy versus those which are not.
+
+The second map shows the change in renewable share, which is to say, which states have been improving, as change in how much of a renewable share they have.
+
+```{r}
+suppressMessages(suppressWarnings({
+  states_sf <- tigris::states(cb = TRUE, year = 2023) |>
+    st_as_sf() |>
+    dplyr::mutate(state = NAME) |>
+    dplyr::filter(STUSPS %in% c(state.abb, "DC"))
+
+  map_2023 <- states_sf |>
+    dplyr::left_join(energy_2023, by = "state") |>
+    sf::st_transform(5070)
+
+  share_change <- energy_all |>
+    dplyr::select(state, year, renewable_share) |>
+    tidyr::pivot_wider(names_from = year, values_from = renewable_share) |>
+    dplyr::mutate(share_change_21_23 = `2023` - `2021`)
+
+  map_change <- states_sf |>
+    dplyr::left_join(share_change, by = "state") |>
+    sf::st_transform(5070)
+}))
+
+# plot 1
+ggplot(map_2023) +
+  geom_sf(aes(fill = renewable_share), color = "white", size = 0.1) +
+  scale_fill_viridis_c(option = "C", labels = scales::percent_format(accuracy = 1),
+                       na.value = "grey90", name = "Renewable share (2023)") +
+  labs(title = "Share of Renewable Energy by State (2023)",
+       subtitle = "renewable_use / total_use",
+       caption = "Source: class datasets") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+
+# plot 2
+ggplot(map_change) +
+  geom_sf(aes(fill = share_change_21_23), color = "white", size = 0.1) +
+  scale_fill_viridis_c(option = "B", labels = scales::label_percent(accuracy = 1),
+                       name = "Δ Renewable share (2021→2023)",
+                       na.value = "grey90") +
+  labs(title = "Change in Renewable Share (2021→2023)",
+       subtitle = "Positive = cleaner grid in 2023 vs 2021",
+       caption = "Source: class datasets") +
+  theme_minimal(base_size = 12)
+```
+
+Taking into account these reuslts, we are able to see that there are states like South Dakota, Oregon, Iowa, and Maine, which currently(2023) have a lot of their energy come from renewable soruces, whereas states like Alaska, Utah, Wyoming, and many across the East Coast do not. However, this is not to say that this is due to a lack of increasing their renewable shares, as indeed, from the second graph, we are able to see that many of these states that have low renewable shares are indeed trying to improve, with some increasing their share of renewable enregy over time. However, some states we would have assumed to be very clean, such as Maine, actually drop in how much renewable energy they produce, which is a very interesting find. It shows that a high use of renewable energy does not suggest a trend in increasing renewable energies. 
+
+Going back to the original question, there are many factors that do tend to show that a high ev count does align with cleaner electricity, especialy with states like California, which has a massive ev count, using more renewable energy. But renewable energy has changed quite a bit across states, but overall across the US, states generally try to lean more towards renewable energies.
